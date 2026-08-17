@@ -1,0 +1,47 @@
+# Python & Bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+ml-env/
+ENV/
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual Environment
+.venv
+ml-env/
+
+# IDEs & OS
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# Heavy raw benchmark files (downloaded via script)
+*.npy
+prompts.csv
+model_results_long.csv
+routerbench_0shot.pkl
+
+# Logs & temporary outputs
+*.log
+.system_generated/
