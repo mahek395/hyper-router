@@ -45,3 +45,8 @@ routerbench_0shot.pkl
 # Logs & temporary outputs
 *.log
 .system_generated/
+
+
+.env
+.env.*
+!.env.example
