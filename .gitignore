@@ -29,7 +29,6 @@ wheels/
 ml-env/
 
 # IDEs & OS
-.vscode/
 .idea/
 *.swp
 *.swo
@@ -45,3 +44,12 @@ routerbench_0shot.pkl
 # Logs & temporary outputs
 *.log
 .system_generated/
+
+
+.env
+.env.*
+!.env.example
+branch_structure.json
+temp_auto_push.bat
+temp_interactive_push.bat
+.gitignore
