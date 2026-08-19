@@ -3,19 +3,32 @@ gateway/complexity_scorer.py
 
 Fast inference module for scoring prompt complexity in the LLM Gateway (Stage 2).
 Uses the trained regression probe + structural heuristic signals.
-Inference time: < 0.2ms (when embedding is provided) or ~15ms (with local embedding model).
+
+Complexity score C is always returned in the range [0.0, 1.0].
 """
 
+import logging
 import os
 import pickle
+import re
+from typing import Any, Dict, Optional
+
 import numpy as np
-from typing import Optional, Dict, Any
+
+
+logger = logging.getLogger(__name__)
 
 
 class ComplexityScorer:
     """
     Evaluates prompt complexity C in [0.0, 1.0].
+
+    Uses:
+      1. Trained regression probe when available.
+      2. Structural heuristic signals.
+      3. Heuristic-only fallback if embedding/model inference fails.
     """
+
     def __init__(
         self,
         model_path: str = "gateway/complexity_model.pkl",
@@ -25,134 +38,358 @@ class ComplexityScorer:
         self.model_path = model_path
         self.embedding_model_name = embedding_model_name
         self.lazy_load_embedder = lazy_load_embedder
-        
+
         self.coef: Optional[np.ndarray] = None
         self.intercept: float = 0.5
+
         self._embedder = None
         self._cache: Dict[str, float] = {}
 
         self._load_model()
 
+    # ------------------------------------------------------------------
+    # Model loading
+    # ------------------------------------------------------------------
+
     def _load_model(self) -> None:
         if os.path.exists(self.model_path):
-            with open(self.model_path, "rb") as f:
-                data = pickle.load(f)
-                self.coef = data["coef"]
-                self.intercept = data["intercept"]
+            try:
+                with open(self.model_path, "rb") as f:
+                    data = pickle.load(f)
+
+                self.coef = np.asarray(data["coef"], dtype=float)
+                self.intercept = float(data["intercept"])
+
+                logger.info(
+                    "ComplexityScorer: loaded model artifact from '%s'",
+                    self.model_path,
+                )
+
+            except Exception as exc:
+                self.coef = None
+                self.intercept = 0.5
+
+                logger.warning(
+                    "ComplexityScorer: failed to load model artifact '%s': %s. "
+                    "Falling back to structural heuristics.",
+                    self.model_path,
+                    exc,
+                )
+
         else:
-            # Fallback uniform default if artifact not yet generated
             self.coef = None
             self.intercept = 0.5
 
+            logger.warning(
+                "ComplexityScorer: no model artifact at '%s' — "
+                "running on structural heuristics only.",
+                self.model_path,
+            )
+
+    # ------------------------------------------------------------------
+    # Embedding model
+    # ------------------------------------------------------------------
+
     @property
     def embedder(self):
+        """
+        Lazily load the sentence-transformers embedding model.
+        """
         if self._embedder is None:
             from sentence_transformers import SentenceTransformer
-            self._embedder = SentenceTransformer(self.embedding_model_name)
+
+            self._embedder = SentenceTransformer(
+                self.embedding_model_name
+            )
+
         return self._embedder
+
+    # ------------------------------------------------------------------
+    # Marker matching
+    # ------------------------------------------------------------------
+
+    _WORD_MARKER_RE = re.compile(r"^[a-z0-9 \-]+$")
+
+    @classmethod
+    def _matches_any(
+        cls,
+        lower_text: str,
+        markers: list[str],
+    ) -> bool:
+        """
+        Match ordinary words/phrases using word boundaries.
+
+        Markers containing symbols such as:
+            ```
+            function(
+        use substring matching instead.
+        """
+
+        for raw in markers:
+            marker = raw.strip()
+
+            if not marker:
+                continue
+
+            if cls._WORD_MARKER_RE.match(marker):
+                if re.search(
+                    rf"\b{re.escape(marker)}\b",
+                    lower_text,
+                ):
+                    return True
+            else:
+                if marker in lower_text:
+                    return True
+
+        return False
+
+    # ------------------------------------------------------------------
+    # Structural heuristics
+    # ------------------------------------------------------------------
 
     def extract_structural_signals(self, text: str) -> float:
         """
-        Extract fast regex/structural signals to augment embedding score:
-        - Code blocks, languages, or algorithmic patterns
-        - Math symbols, formal proofs, and statistical formulations
-        - Multi-step reasoning and deep analysis keywords
-        - Conversational / simple factual query discounts
+        Calculate heuristic complexity adjustment.
+
+        Returns a signed boost/penalty, e.g.
+            +0.22 = more complex
+            -0.25 = simpler
+             0.00 = neutral
         """
+
         boost = 0.0
         lower = text.lower()
-        
-        # 1. High-difficulty code / systems programming detection
+
+        # --------------------------------------------------------------
+        # Programming / systems complexity
+        # --------------------------------------------------------------
+
         hard_code_markers = [
-            "cuda", "kernel", "mutex", "deadlock", "concurrency", "websocket",
-            "autodiff", "refactor", "memory leak", "pointer", "assembly", "bytecode",
-            "optimization", "profiler", "distributed", "lock contention"
+            "cuda",
+            "kernel",
+            "mutex",
+            "deadlock",
+            "concurrency",
+            "websocket",
+            "autodiff",
+            "refactor",
+            "memory leak",
+            "pointer",
+            "assembly",
+            "bytecode",
+            "optimization",
+            "profiler",
+            "distributed",
+            "lock contention",
         ]
-        if any(m in lower for m in hard_code_markers):
+
+        if self._matches_any(lower, hard_code_markers):
             boost += 0.22
-        elif any(m in lower for m in ["```", "def ", "class ", "function(", "import ", "select * from", "return ", "const "]):
+
+        elif self._matches_any(
+            lower,
+            [
+                "```",
+                "def",
+                "class",
+                "function(",
+                "import",
+                "select * from",
+                "return",
+                "const",
+            ],
+        ):
             boost += 0.10
 
-        # 2. Mathematical reasoning / proof detection
+        # --------------------------------------------------------------
+        # Mathematics
+        # --------------------------------------------------------------
+
         math_markers = [
-            "prove that", "derive ", "calculate the probability", "integral", "matrix",
-            "eigenvalue", "theorem", "dirichlet", "multinomial", "bayes posterior",
-            "stochastic", "differential equation", "combinatorics"
+            "prove that",
+            "derive",
+            "calculate the probability",
+            "integral",
+            "matrix",
+            "eigenvalue",
+            "theorem",
+            "dirichlet",
+            "multinomial",
+            "bayes posterior",
+            "stochastic",
+            "differential equation",
+            "combinatorics",
         ]
-        if any(m in lower for m in math_markers):
+
+        if self._matches_any(lower, math_markers):
             boost += 0.25
 
-        # 3. Deep analysis & comparison indicators
+        # --------------------------------------------------------------
+        # Deep analysis / architecture
+        # --------------------------------------------------------------
+
         analysis_markers = [
-            "micro-architectural", "cache hierarchy", "root cause analysis",
-            "tradeoffs between", "in-depth breakdown", "formal verification",
-            "architecture diagram"
+            "micro-architectural",
+            "cache hierarchy",
+            "root cause analysis",
+            "tradeoffs between",
+            "in-depth breakdown",
+            "formal verification",
+            "architecture diagram",
         ]
-        if any(m in lower for m in analysis_markers):
+
+        if self._matches_any(lower, analysis_markers):
             boost += 0.20
 
-        # 4. Simple conversational / factual / lookup discounts (easy queries)
+        # --------------------------------------------------------------
+        # Simple prompts
+        # --------------------------------------------------------------
+
         simple_markers = [
-            "what time", "what is the capital", "translate", "hello", "hi", "how are you",
-            "synonym for", "who is", "weather in", "define ", "meaning of"
+            "what time",
+            "what is the capital",
+            "translate",
+            "hello",
+            "hi",
+            "how are you",
+            "synonym for",
+            "who is",
+            "weather in",
+            "define",
+            "meaning of",
         ]
-        if any(m in lower for m in simple_markers) or len(text.split()) < 10:
-            if not any(m in lower for m in ["code", "solve", "math", "why", "derive", "cuda", "mutex"]):
+
+        if self._matches_any(lower, simple_markers) or len(text.split()) < 10:
+            if not self._matches_any(
+                lower,
+                [
+                    "code",
+                    "solve",
+                    "math",
+                    "why",
+                    "derive",
+                    "cuda",
+                    "mutex",
+                ],
+            ):
                 boost -= 0.25
 
         return boost
 
+    # ------------------------------------------------------------------
+    # Main scoring function
+    # ------------------------------------------------------------------
+
     def score(
         self,
-        prompt_text: str,
-        embedding: Optional[np.ndarray] = None,
+        text: str,
+        embedding: Optional[Any] = None,
     ) -> float:
         """
-        Scores prompt complexity C in [0.0, 1.0].
-        
-        Args:
-            prompt_text: Raw string prompt
-            embedding: Optional precomputed 1D vector (dim=384)
-            
-        Returns:
-            Continuous difficulty score from 0.0 (trivial) to 1.0 (frontier-level reasoning).
+        Return prompt complexity in the range [0.0, 1.0].
+
+        Flow:
+
+            prompt
+              ↓
+        cache lookup
+              ↓
+        trained model (when available)
+              +
+        structural heuristics
+              ↓
+        clamp to [0, 1]
+
+        If the trained model or embedding process fails,
+        a heuristic-only score is returned.
         """
-        if prompt_text in self._cache:
-            return self._cache[prompt_text]
 
-        if embedding is None:
-            embedding = self.embedder.encode([prompt_text], show_progress_bar=False)[0]
+        if not text or not text.strip():
+            return 0.0
 
-        if self.coef is not None:
-            raw_score = float(np.dot(embedding, self.coef) + self.intercept)
-        else:
-            raw_score = 0.5
+        # --------------------------------------------------------------
+        # Cache
+        # --------------------------------------------------------------
 
-        # Augment with fast structural rules
-        structural_adj = self.extract_structural_signals(prompt_text)
-        final_score = float(np.clip(raw_score + structural_adj, 0.05, 0.99))
+        cached = self._cache.get(text)
 
-        # Cache query
-        if len(self._cache) < 10_000:
-            self._cache[prompt_text] = final_score
+        if cached is not None:
+            return cached
 
-        return final_score
+        # --------------------------------------------------------------
+        # Structural signal
+        # --------------------------------------------------------------
 
-    def score_batch(
-        self,
-        prompts: list[str],
-        embeddings: Optional[np.ndarray] = None,
-    ) -> np.ndarray:
-        """Vectorized batch scoring for offline evaluation."""
-        if embeddings is None:
-            embeddings = self.embedder.encode(prompts, show_progress_bar=False, batch_size=64)
+        structural_boost = self.extract_structural_signals(text)
 
-        if self.coef is not None:
-            raw_scores = np.dot(embeddings, self.coef) + self.intercept
-        else:
-            raw_scores = np.full(len(prompts), 0.5)
+        # --------------------------------------------------------------
+        # Heuristic-only mode
+        # --------------------------------------------------------------
 
-        # Apply structural adjustments vectorized
-        adjustments = np.array([self.extract_structural_signals(p) for p in prompts])
-        final_scores = np.clip(raw_scores + adjustments, 0.05, 0.99)
-        return final_scores
+        if self.coef is None:
+            score = 0.5 + structural_boost
+            score = max(0.0, min(1.0, score))
+
+            self._cache[text] = score
+
+            return score
+
+        # --------------------------------------------------------------
+        # Trained-model inference
+        # --------------------------------------------------------------
+
+        try:
+            if embedding is None:
+                embedding = self.embedder.encode(
+                    [text],
+                    normalize_embeddings=True,
+                )[0]
+
+            embedding = np.asarray(
+                embedding,
+                dtype=float,
+            )
+
+            # Validate dimensions.
+            if embedding.ndim != 1:
+                embedding = embedding.reshape(-1)
+
+            if self.coef.shape[0] != embedding.shape[0]:
+                raise ValueError(
+                    "Embedding dimension mismatch: "
+                    f"model expects {self.coef.shape[0]}, "
+                    f"received {embedding.shape[0]}"
+                )
+
+            model_score = float(
+                np.dot(self.coef, embedding) + self.intercept
+            )
+
+            final_score = model_score + structural_boost
+
+            final_score = max(
+                0.0,
+                min(1.0, final_score),
+            )
+
+            self._cache[text] = final_score
+
+            return final_score
+
+        except Exception as exc:
+            logger.warning(
+                "ComplexityScorer.score failed: %s — "
+                "using heuristic fallback.",
+                exc,
+            )
+
+            fallback_score = 0.5 + structural_boost
+
+            fallback_score = max(
+                0.0,
+                min(1.0, fallback_score),
+            )
+
+            self._cache[text] = fallback_score
+
+            return fallback_score
